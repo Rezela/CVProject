@@ -14,14 +14,45 @@ import shutil
 import sys
 import time
 import uuid
+from collections import Counter
+
 import cv2
 import base64
 import time
 import pprint
+import numpy as np
 
 from imwatermark import WatermarkEncoder, WatermarkDecoder
 
 pp = pprint.PrettyPrinter(indent=2)
+
+
+def repeat_encode(text, n=1):
+    if n <= 1:
+        return text
+    return ''.join(char * n for char in text)
+
+
+def vote_decode(text, n=1):
+    if n <= 1 or not text:
+        return text
+    decoded = []
+    for i in range(0, len(text), n):
+        chunk = text[i:i + n]
+        most_common = Counter(chunk).most_common(1)[0][0]
+        decoded.append(most_common)
+    return ''.join(decoded)
+
+
+def adaptive_preprocess(image, attack_type='none'):
+    if attack_type == 'blur':
+        kernel = np.array([[-1, -1, -1],
+                           [-1, 9, -1],
+                           [-1, -1, -1]])
+        return cv2.filter2D(image, -1, kernel)
+    if attack_type == 'noise':
+        return cv2.medianBlur(image, 3)
+    return image
 
 
 class CustomArgParseFormatter(
@@ -47,6 +78,11 @@ def main():
                         help='The path of output')
     parser.add_argument('-v', '--verbose', required=False, default=False,
                         action='store_true', help='print info')
+    parser.add_argument('--redundancy', type=int, default=1,
+                        help='repeat each watermark character N times to add redundancy')
+    parser.add_argument('--attack-type', default='none',
+                        choices=['none', 'blur', 'noise'],
+                        help='apply adaptive preprocessing before decoding')
     args = parser.parse_args()
     action = args.action
     inputFile = args.input
@@ -64,12 +100,14 @@ def main():
         if args.method == 'rivaGan':
             WatermarkEncoder.loadModel()
         bgr = cv2.imread(args.input)
+        redundancy = max(1, args.redundancy)
+        watermark_text = repeat_encode(args.watermark, redundancy)
         if args.type == 'bytes':
-            wm = args.watermark.encode('utf-8')
+            wm = watermark_text.encode('utf-8')
         elif args.type == 'b16':
-            wm = args.watermark.upper().encode('utf-8')
+            wm = watermark_text.upper().encode('utf-8')
         elif args.type == 'bits':
-            wm = [int(c) % 2 for c in args.watermark]
+            wm = [int(c) % 2 for c in watermark_text]
         else:
             wm = args.watermark
         encoder.set_watermark(wmType, wm)
@@ -91,12 +129,20 @@ def main():
         if args.method == 'rivaGan':
             WatermarkDecoder.loadModel()
         bgr = cv2.imread(args.input)
+        bgr = adaptive_preprocess(bgr, args.attack_type)
         start = time.time()
         wm = decoder.decode(bgr, args.method)
         if args.verbose:
             print('decode time ms:', (time.time()-start) * 1000)
         if args.type in ['bytes', 'b16']:
             wm = wm.decode('utf-8')
+        redundancy = max(1, args.redundancy)
+        if redundancy > 1 and args.type in ['bytes', 'b16']:
+            wm = vote_decode(wm, redundancy)
+        elif redundancy > 1 and args.type == 'bits':
+            bit_string = ''.join(str(bit) for bit in wm)
+            voted_bits = vote_decode(bit_string, redundancy)
+            wm = [int(c) for c in voted_bits]
         print(wm)
     else:
         sys.stderr.write('unknown action\n')
